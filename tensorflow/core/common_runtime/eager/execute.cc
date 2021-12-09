@@ -482,6 +482,18 @@ Status BuildWrappedOpName(EagerOperation* op, const OpDef& opdef,
   return Status::OK();
 }
 
+// Validates the node def. This is required when running in eager op as function
+// mode because this code path does not go through the _apply_op_helper's
+// validation (which is reached when executing in graph mode)
+// or the eager execution's validation (which is reached via the CreateOpKernel
+// call).
+Status ValidateOp(EagerOperation* op) {
+  const NodeDef& node_def = op->MutableAttrs()->BuildNodeDef();
+  const OpDef* op_def;
+  TF_RETURN_IF_ERROR(OpRegistry::Global()->LookUpOpDef(node_def.op(), &op_def));
+  return ValidateNodeDef(node_def, *op_def);
+}
+
 // Builds the signature of the wrapping FunctionDef for an eager op.
 //
 // For ops without variadic inputs/outputs, the signature is the same as the
@@ -631,7 +643,7 @@ Status BuildWrappedOpSignature(EagerOperation* op, const OpDef& opdef,
           return errors::Internal("Unable to read attr ", arg.number_attr(),
                                   " for op ", op->Name());
         }
-        for (size_t i = 0; i < number_attr; i++) {
+        for (int64_t i = 0; i < number_attr; i++) {
           auto arg_def = sig_args->Add();
           arg_def->set_name(GetFlatName(arg.name(), i));
           if (!arg.type_attr().empty()) {
@@ -819,11 +831,33 @@ Status WrapInCallOp(EagerOperation* op, EagerOperation** wrapped_op) {
   return AddMixedTypeListAttrs(*wrapped_op, op_attrs, opdef);
 }
 
+bool IntArgsAndRetvalsOnDevice(EagerOperation* op) {
+  // Most TF ops expect and generate int32 tensors on the host (or a TPU/XLA
+  // device). This is not the case with IteratorGetNext since it is possible to
+  // build int32 datasets that produce outputs on device when using
+  // prefetch_to_device.
+  // When running call ops, by default we assume that the int32 outputs are on a
+  // host (except for the XLA/TPU case). So we need to special case
+  // IteratorGetNext such that its eager behavior matches the wrapped one.
+  // TODO(b/208435025): Remove this if we end up deciding that int32 outputs
+  // from IteratorGetNext should indeed live on host.
+  return op->Name() == "IteratorGetNext";
+}
+
 Status GetOrCreateKernelAndDevice(
     EagerOperation* op, TensorHandle** retvals, int* num_retvals,
     core::RefCountPtr<KernelAndDevice>* out_kernel) {
   EagerContext& ctx = op->EagerContext();
   Device* device = absl::get<Device*>(op->Device());
+
+  // Save the original value of reuse_rendezvous_for_functions from the context.
+  bool reuse_rendezvous_for_functions_original_value =
+      ctx.GetReuseRendezvousForFunctions();
+  // When running in eager_op_as_function mode Send/Recv ops need to be
+  // placed on the same rendezvous to match the behaviour of eager mode.
+  bool reuse_rendezvous_for_functions =
+      (ctx.RunEagerOpAsFunction() && !op->is_function()) ||
+      reuse_rendezvous_for_functions_original_value;
 
   Fprint128 cache_key = op->MutableAttrs()->CacheKey(op->DeviceName());
   /// Include soft placement policy in cache key since the placement strategy
@@ -837,8 +871,7 @@ Status GetOrCreateKernelAndDevice(
 
   // The launch-time rendezvous reuse setting is bundled with the kernel, so we
   // need to include it in the cache key.
-  cache_key =
-      FingerprintCat128(cache_key, ctx.GetReuseRendezvousForFunctions());
+  cache_key = FingerprintCat128(cache_key, reuse_rendezvous_for_functions);
 
   std::vector<Device*> input_dev_ptrs;
   absl::flat_hash_map<string, const std::vector<string>*> composite_devices;
@@ -979,14 +1012,21 @@ Status GetOrCreateKernelAndDevice(
     // jit compiled. Ideally we would run this via the jit compiled path and
     // expect unsupported ops to be outside compiled but that is not supported
     // on GPUs right now.
+    bool allow_small_function_optimizations = false;
+    bool int_args_and_retvals_on_device = false;
+    bool allow_control_flow_sync_execution = false;
     if (ctx.RunEagerOpAsFunction() && !op->is_function()) {
       EagerOperation* wrapped_op = nullptr;
+      TF_RETURN_IF_ERROR(ValidateOp(op));
       TF_RETURN_IF_ERROR(WrapInCallOp(op, &wrapped_op));
       DCHECK(wrapped_op);
       DCHECK(wrapped_op->is_function());
       wrapped_op_releaser.reset(wrapped_op);
-      op = wrapped_op;
       run_function_with_flr = true;
+      allow_small_function_optimizations = true;
+      allow_control_flow_sync_execution = true;
+      int_args_and_retvals_on_device = IntArgsAndRetvalsOnDevice(op);
+      op = wrapped_op;
     }
     const NodeDef& ndef = op->MutableAttrs()->BuildNodeDef();
 
@@ -1018,12 +1058,21 @@ Status GetOrCreateKernelAndDevice(
 #if !defined(IS_MOBILE_PLATFORM)
       get_op_id = [&ctx]() { return ctx.RemoteMgr()->NextOpId(); };
 #endif  // IS_MOBILE_PLATFORM
+
+      ctx.reuse_rendezvous_for_functions_mu()->lock();
+      ctx.SetReuseRendezvousForFunctions(reuse_rendezvous_for_functions);
+      auto rendezvous_creator = ctx.RendezvousCreator();
+      ctx.SetReuseRendezvousForFunctions(
+          reuse_rendezvous_for_functions_original_value);
+      ctx.reuse_rendezvous_for_functions_mu()->unlock();
       kernel.reset(new KernelAndDeviceFunc(
           flr, ctx.pflr(), std::move(input_dev_ptrs),
           std::move(composite_devices),
           std::move(input_resource_variable_dtypes_and_shapes), runner,
           ctx.GetCollectiveExecutorHandle(), ctx.HostCPU(), op->Name(),
-          function_outputs_on_op_device, ctx.RendezvousCreator(), get_op_id));
+          function_outputs_on_op_device, allow_small_function_optimizations,
+          allow_control_flow_sync_execution, int_args_and_retvals_on_device,
+          std::move(rendezvous_creator), get_op_id));
     } else {
       VLOG(2) << "Running " << ndef.op() << " using op kernel. "
               << ". Full node_def=" << ndef.DebugString();
@@ -1580,6 +1629,13 @@ Status EagerExecute(EagerOperation* op, TensorHandle** retvals,
       profiler::TraceMeLevel::kInfo);
 
   if (!op->Executor().Async()) {
+    VLOG(6) << "op: " << op->Name() << " is not Async.";
+    if (!op->EagerContext()
+             .GetGlobalRendezvousForFunctionLocalRendezvousStatus()
+             .ok()) {
+      VLOG(6) << "global_rendezvous_for_functions_ is in bad state. Resetting.";
+      op->EagerContext().ResetGlobalRendezvousForFunction();
+    }
     // In sync mode, always clear error to maintain the same behavior as before.
     // TODO(b/141004939): Remove this.
     op->Executor().ClearError();
